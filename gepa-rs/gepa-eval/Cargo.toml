@@ -1,0 +1,9 @@
+[package]
+name = "gepa-eval"
+description = "Evaluators (`gepa_core::Adapter::evaluate`): subprocess command / HTTP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gepa-core.workspace = true

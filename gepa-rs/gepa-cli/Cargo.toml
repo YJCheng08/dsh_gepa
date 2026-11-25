@@ -1,0 +1,13 @@
+[package]
+name = "gepa-cli"
+description = "`gepa` binary: run a task file, stream NDJSON events, checkpoint/resume"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gepa"
+path = "src/main.rs"
+
+[dependencies]
+gepa-core.workspace = true

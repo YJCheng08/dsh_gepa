@@ -1,0 +1,10 @@
+[package]
+name = "gepa-core"
+description = "GEPA search engine: Pareto frontier, candidate/minibatch selection, merge, IO-free"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
