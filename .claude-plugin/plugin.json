@@ -1,0 +1,6 @@
+{
+  "name": "gepa",
+  "version": "0.1.0",
+  "description": "Evolutionary Pareto optimizer (gepa-rs) for LLM agent system prompts, source code, and GPU kernels.",
+  "repository": "https://github.com/YJCheng08/dsh_gepa"
+}

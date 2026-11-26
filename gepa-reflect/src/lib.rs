@@ -4,25 +4,37 @@
 
 pub mod client;
 pub mod extract;
+pub mod lineage;
 pub mod template;
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
-use gepa_core::{Candidate, DataId, EvalBatch};
+use gepa_core::{Candidate, DataId, EvalBatch, Split};
 
-pub use client::{LmClient, LmConfig, OpenAiClient, is_loopback_url};
+pub use client::{LmClient, LmConfig, OpenAiClient, is_loopback_url, should_bypass_proxy};
 pub use extract::{extract_code_block, strip_thinking};
-pub use template::{PromptConfig, format_feedback, render_prompt};
+pub use lineage::{EvalRecord, Lineage};
+pub use template::{PromptConfig, format_feedback, render_prompt, render_prompt_with_lineage};
 
 /// Generates mutated candidate component texts using an [`LmClient`] and [`PromptConfig`].
 pub struct Reflector<C: LmClient> {
     pub client: C,
     pub prompt: PromptConfig,
+    pub lineage: Lineage,
 }
 
 impl<C: LmClient> Reflector<C> {
     pub fn new(client: C, prompt: PromptConfig) -> Self {
-        Self { client, prompt }
+        Self {
+            client,
+            prompt,
+            lineage: Lineage::default(),
+        }
+    }
+
+    pub fn record_eval(&mut self, candidate: &Candidate, split: Split, eval: &EvalBatch) {
+        self.lineage.record_eval(candidate, split, eval);
     }
 
     /// Propose updated text for each requested component of `parent` given `eval` on `ids`.
@@ -33,16 +45,51 @@ impl<C: LmClient> Reflector<C> {
         eval: &EvalBatch,
         components: &[String],
     ) -> gepa_core::Result<BTreeMap<String, String>> {
-        let mut out = BTreeMap::new();
+        let mut out: BTreeMap<String, String> = BTreeMap::new();
         for comp in components {
             if !parent.contains_key(comp) {
                 return Err(format!("unknown component {comp:?} in candidate").into());
             }
-            let prompt = render_prompt(&self.prompt, parent, comp, ids, eval);
-            let raw = self.client.complete(&prompt)?;
-            let extracted = extract_code_block(&raw);
-            out.insert(comp.clone(), extracted);
+            let lineage_ctx = if self.prompt.lineage {
+                self.lineage.render_context(parent, comp)
+            } else {
+                String::new()
+            };
+            let mut ask_prompt =
+                render_prompt_with_lineage(&self.prompt, parent, comp, ids, eval, &lineage_ctx);
+            let mut chosen = String::new();
+            for attempt in 0..=2 {
+                let raw = self.client.complete(&ask_prompt)?;
+                let extracted = extract_code_block(&raw);
+                chosen = extracted;
+                if !self.prompt.lineage || attempt == 2 {
+                    break;
+                }
+                let mut trial = parent.clone();
+                trial.extend(out.iter().map(|(k, v)| (k.clone(), v.clone())));
+                trial.insert(comp.clone(), chosen.clone());
+                if trial == *parent {
+                    let _ = write!(
+                        ask_prompt,
+                        "\n\nYour previous proposal made no changes to `{comp}`; propose a meaningful edit."
+                    );
+                    continue;
+                }
+                if let Some(prev) = self.lineage.find(&trial) {
+                    let _ = write!(
+                        ask_prompt,
+                        "\n\nYour previous proposal duplicated an already-evaluated candidate (score={:.4}, status={}); propose a different change.",
+                        prev.score, prev.status
+                    );
+                    continue;
+                }
+                break;
+            }
+            out.insert(comp.clone(), chosen);
         }
+        let mut final_child = parent.clone();
+        final_child.extend(out.iter().map(|(k, v)| (k.clone(), v.clone())));
+        self.lineage.note_proposal(parent, &final_child);
         Ok(out)
     }
 }
@@ -215,5 +262,87 @@ mod tests {
         assert_eq!(reply, "```\nfixed\n```");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn lineage_renders_failures_cross_branch_and_submetrics() {
+        let mut lin = Lineage::default();
+        let parent = Candidate::from([("p".into(), "line1\nline2\n".into())]);
+        let child_bad = Candidate::from([("p".into(), "line1\nbad_edit\n".into())]);
+        let branch_best = Candidate::from([("p".into(), "line1\nbest_edit\n".into())]);
+        let sub_lead = Candidate::from([("p".into(), "line1\nfast_edit\n".into())]);
+
+        let eval_with = |s: f64, pass: f64, spd: f64, err: Option<&str>| EvalBatch {
+            scores: vec![s],
+            objectives: Some(vec![BTreeMap::from([("pass".into(), pass), ("speed".into(), spd)])]),
+            feedback: vec![err.map(|e| json!({"error": e})).unwrap_or_else(|| json!({}))],
+            metric_calls: None,
+        };
+
+        lin.record_eval(&parent, Split::Val, &eval_with(0.4, 0.0, 0.5, None));
+        lin.records[0].accepted = true;
+        lin.note_proposal(&parent, &child_bad);
+        lin.record_eval(&child_bad, Split::Train, &eval_with(0.0, 0.0, 0.0, Some("nvcc compile error")));
+        lin.record_eval(&branch_best, Split::Val, &eval_with(0.9, 1.0, 0.8, None));
+        lin.records[2].accepted = true;
+        lin.record_eval(&sub_lead, Split::Val, &eval_with(0.5, 0.0, 1.9, None));
+        lin.records[3].accepted = true;
+
+        let ctx = lin.render_context(&parent, "p");
+        assert!(ctx.contains("Trial History & Rejected Edits"), "{ctx}");
+        assert!(ctx.contains("nvcc compile error"), "{ctx}");
+        assert!(ctx.contains("-line2\n+bad_edit"), "{ctx}");
+        assert!(ctx.contains("Best Accepted Branch"), "{ctx}");
+        assert!(ctx.contains("+best_edit"), "{ctx}");
+        assert!(ctx.contains("Sub-Metric Leaders"), "{ctx}");
+        assert!(ctx.contains("same as Best Accepted Branch above"), "{ctx}");
+        assert!(ctx.contains("+fast_edit"), "{ctx}");
+    }
+
+    #[test]
+    fn propose_retries_on_duplicate_in_lineage() {
+        struct SeqLm {
+            prompts: Vec<String>,
+            replies: Vec<String>,
+            idx: usize,
+        }
+        impl LmClient for SeqLm {
+            fn complete(&mut self, prompt: &str) -> gepa_core::Result<String> {
+                self.prompts.push(prompt.to_string());
+                let r = self.replies[self.idx].clone();
+                self.idx += 1;
+                Ok(r)
+            }
+        }
+
+        let lm = SeqLm {
+            prompts: vec![],
+            replies: vec!["```\ndup_text\n```".into(), "```\nfresh_text\n```".into()],
+            idx: 0,
+        };
+        let mut reflector = Reflector::new(lm, PromptConfig::default());
+        let parent = Candidate::from([("p".into(), "seed_text".into())]);
+        let dup = Candidate::from([("p".into(), "dup_text".into())]);
+        reflector.record_eval(&parent, Split::Val, &EvalBatch { scores: vec![0.5], ..Default::default() });
+        reflector.record_eval(
+            &dup,
+            Split::Train,
+            &EvalBatch {
+                scores: vec![0.0],
+                feedback: vec![json!({"error": "bad syntax"})],
+                ..Default::default()
+            },
+        );
+
+        let eval = EvalBatch {
+            scores: vec![0.5],
+            feedback: vec![json!({"note": "needs work"})],
+            ..Default::default()
+        };
+        let out = reflector.propose(&parent, &[0], &eval, &["p".into()]).unwrap();
+        assert_eq!(out["p"], "fresh_text");
+        assert_eq!(reflector.client.prompts.len(), 2);
+        assert!(reflector.client.prompts[1].contains("duplicated an already-evaluated candidate"));
+        assert!(reflector.client.prompts[1].contains("bad syntax"));
     }
 }

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use gepa_core::{Adapter, Candidate, DataId, Engine, EvalBatch, Event, Split};
 use gepa_eval::{AnyEvaluator, Evaluator};
-use gepa_reflect::{OpenAiClient, Reflector};
+use gepa_reflect::{Lineage, OpenAiClient, Reflector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -86,8 +86,11 @@ impl Adapter for CliAdapter {
                 .ok_or_else(|| format!("example id {id} out of range for {split:?} (len={})", dataset.len()))?;
             examples.push(ex.clone());
         }
-        self.evaluator
-            .evaluate(candidate, split, ids, &examples, capture_traces)
+        let batch = self
+            .evaluator
+            .evaluate(candidate, split, ids, &examples, capture_traces)?;
+        self.reflector.record_eval(candidate, split, &batch);
+        Ok(batch)
     }
 
     fn propose(
@@ -172,10 +175,17 @@ pub fn run_task(mut task: LoadedTask, opts: RunOptions) -> gepa_core::Result<Sum
     };
 
     let ckpt_path = opts.run_dir.join("checkpoint.json");
+    let lineage_path = opts.run_dir.join("lineage.json");
     let mut engine = if !opts.fresh && ckpt_path.exists() {
         let raw = fs::read_to_string(&ckpt_path)?;
         let mut resumed: Engine = serde_json::from_str(&raw)?;
         resumed.config.stop = config.stop.clone();
+        if let Ok(lin_raw) = fs::read_to_string(&lineage_path)
+            && let Ok(lin) = serde_json::from_str::<Lineage>(&lin_raw)
+        {
+            adapter.reflector.lineage = lin;
+        }
+        adapter.reflector.lineage.sync_state(&resumed.state);
         adapter.emit_json(&json!({
             "event": "resumed",
             "iteration": resumed.state.iteration,
@@ -191,34 +201,41 @@ pub fn run_task(mut task: LoadedTask, opts: RunOptions) -> gepa_core::Result<Sum
             task.val_data.len(),
             &mut adapter,
         )?;
+        adapter.reflector.lineage.sync_state(&eng.state);
         let seed_score = eng.state.val_average(0);
         adapter.emit_json(&json!({
             "event": "seed_evaluated",
             "val_score": seed_score,
             "total_evals": eng.state.total_evals,
         }));
-        persist_checkpoint(&opts.run_dir, &eng)?;
+        persist_checkpoint(&opts.run_dir, &eng, &adapter.reflector.lineage)?;
         eng
     };
 
     while !engine.should_stop() {
         match engine.step(&mut adapter) {
-            Ok(_) => persist_checkpoint(&opts.run_dir, &engine)?,
+            Ok(_) => {
+                adapter.reflector.lineage.sync_state(&engine.state);
+                persist_checkpoint(&opts.run_dir, &engine, &adapter.reflector.lineage)?;
+            }
             Err(e) => {
                 if engine.config.raise_on_error {
-                    let _ = persist_checkpoint(&opts.run_dir, &engine);
+                    adapter.reflector.lineage.sync_state(&engine.state);
+                    let _ = persist_checkpoint(&opts.run_dir, &engine, &adapter.reflector.lineage);
                     return Err(e);
                 }
                 adapter.on_event(&Event::Error {
                     iteration: engine.state.iteration,
                     message: e.to_string(),
                 });
-                persist_checkpoint(&opts.run_dir, &engine)?;
+                adapter.reflector.lineage.sync_state(&engine.state);
+                persist_checkpoint(&opts.run_dir, &engine, &adapter.reflector.lineage)?;
             }
         }
     }
 
-    persist_checkpoint(&opts.run_dir, &engine)?;
+    adapter.reflector.lineage.sync_state(&engine.state);
+    persist_checkpoint(&opts.run_dir, &engine, &adapter.reflector.lineage)?;
 
     let (best_idx, best_cand) = engine.best();
     let best_cand_owned = best_cand.clone();
@@ -255,8 +272,9 @@ pub fn run_task(mut task: LoadedTask, opts: RunOptions) -> gepa_core::Result<Sum
     Ok(summary)
 }
 
-fn persist_checkpoint(run_dir: &Path, engine: &Engine) -> gepa_core::Result<()> {
+fn persist_checkpoint(run_dir: &Path, engine: &Engine, lineage: &Lineage) -> gepa_core::Result<()> {
     write_atomic(&run_dir.join("checkpoint.json"), serde_json::to_string(engine)?.as_bytes())?;
+    write_atomic(&run_dir.join("lineage.json"), serde_json::to_string(lineage)?.as_bytes())?;
     let (_, best) = engine.best();
     write_atomic(
         &run_dir.join("best_candidate.json"),

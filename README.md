@@ -1,275 +1,151 @@
-# gepa-rs
+# gepa-rs 使用指南
 
-`gepa-rs` 是 **GEPA（Genetic-Pareto Reflective Evolution，反射式遗传帕累托优化）** 算法的 Rust 移植实现（对应 Python 版 `gepa 0.1.4` 的核心搜索引擎与 `optimize_anything` 默认策略）。
+`gepa` 是一个单文件跨平台进化优化器，通过“真实评估 → 大模型反思改写 → 帕累托留优”的闭环，自动改进 **LLM Agent 的系统提示词（Prompt）** 或 **源码 / GPU Kernel 文件**。它不依赖 Python `gepa` / `litellm`，也不绑定特定 Agent 工具。
 
-它用于优化由一个或多个命名文本组件构成的目标产物（如 System Prompt、Agent 多阶段指令、代码片段等），结合 **执行轨迹反射变异（Reflective Mutation）**、**多维帕累托前沿维护（Pareto Frontier）** 与 **谱系三路合并（Genealogical Merge）**，在有限的评估预算内高效搜索最优文本组合。
-
----
-
-## 核心特性
-
-- **Sans-IO 无副作用内核（Functional Core, Imperative Shell）**：核心库 `gepa-core` **零网络、零文件 IO、零内置大模型依赖**（仅依赖 `serde` 与 `serde_json`）。所有外部交互（运行评估、调用大模型生成新文本、事件监听）全部收敛于单一的 `Adapter` Trait。
-- **多维帕累托前沿保留专长候选**：不止看验证集平均分，支持按样本（`Instance`）、按指标（`Objective`）、混合（`Hybrid`）及笛卡尔积（`Cartesian`）维护帕累托前沿，避免局部专长型候选在早期被均值淘汰。
-- **基于共同祖先的谱系合并（3-Way Merge）**：追踪所有候选的演化有向无环图（DAG），自动寻找非支配池中具有共同祖先且修改互补的两个分支进行组件级三路合并，并通过分层子采样快速验真。
-- **完全确定性与原生断点续跑（Checkpoint / Resume）**：全量采用 `BTreeMap` / `BTreeSet` 消除哈希随机性，内置可序列化的 `SplitMix64` 随机数生成器。任意时刻将 `Engine` 序列化为 JSON 即为完整快照，反序列化后可无缝恢复相同的随机数流与搜索轨迹。
-
----
-
-## Workspace 目录与模块状态
-
-本项目采用 Rust Workspace（Edition 2024）组织，划分为四个职责解耦的 Crate：
-
-```text
-gepa-rs/
-├── gepa-core/       # [已完成] 纯算法核心引擎：状态、帕累托前沿、反射循环、谱系合并、策略与停止条件
-│   ├── src/
-│   │   ├── lib.rs         # 公共导出与错误类型定义
-│   │   ├── engine.rs      # Engine 主循环、Adapter 接口、反射变异与合并调度
-│   │   ├── state.rs       # Candidate/State 数据结构与四类帕累托前沿更新
-│   │   ├── pareto.rs      # 支配剪枝 (remove_dominated) 与按前沿持有数加权采样
-│   │   ├── merge.rs       # 共同祖先搜索、组件级三路合并与分层验证集子采样
-│   │   ├── strategies.rs  # 父代选择、组件轮询、Epoch 分批采样、接受门控与停止器
-│   │   └── rng.rs         # 可序列化的确定性 SplitMix64 伪随机数生成器
-│   └── tests/
-│       └── engine.rs      # 端到端收敛、确定性快照回放、支配剪枝与合并单元测试
-├── gepa-reflect/    # [已完成] Adapter::propose 实现：反馈模板渲染、代码块提取与 OpenAI 兼容客户端
-│   └── src/
-│       ├── lib.rs         # Reflector 入口与单测
-│       ├── template.rs    # PromptConfig、有序 side_info 渲染与 hide_keys 脱敏
-│       ├── extract.rs     # <think> 推理块剥离与嵌套代码块提取
-│       └── client.rs      # LmClient trait 与 ureq 同步 OpenAiClient（自动绕过环回代理）
-├── gepa-eval/       # [已完成] Adapter::evaluate 实现：并发评估与跨平台进程树超时清理
-│   └── src/
-│       ├── lib.rs         # EvalConfig、Evaluator trait 与线程池并发调度
-│       ├── process.rs     # 跨平台进程树强杀（Windows taskkill /T、Unix killpg）
-│       ├── command.rs     # command_json：子进程 stdin/stdout JSON 协议评估器
-│       ├── workspace.rs   # shell_check：隔离临时工作区、protect 保护与 GEPA_SCORE 解析
-│       └── http.rs        # http：远程/本地 HTTP JSON 评估端点
-└── gepa-cli/        # [已完成] `gepa` 命令行入口与通用任务 Schema（含旧版任务兼容层）
-    ├── src/
-    │   ├── main.rs        # clap 子命令：run / init / status / stop / convert
-    │   ├── schema.rs      # 通用 TaskSpec v1（generalize / multi / single）与数据集加载
-    │   ├── legacy.rs      # gepa_plugin 旧版 tasks/*.json 自动识别与转换
-    │   └── runner.rs      # NDJSON 事件流、原子 checkpoint 存盘、status 摘要与 STOP 控制
-    └── tests/
-        └── cli.rs         # init / convert / run / resume / status / stop 端到端集成测试
-```
-
----
-
-## 系统架构与单步演化流程
+## 全流程：如何配合 LLM Agent 使用
 
 ```mermaid
-flowchart TD
-    Host["宿主程序 / CLI"] <-->|"实现 Adapter Trait<br/>(evaluate / propose / on_event)"| Engine["gepa-core::Engine"]
+flowchart LR
+    Caller["外层开发者 / 编码 Agent"] -->|"1. 准备 task.json，执行 gepa run"| Pool["帕累托候选池 (gepa-core)"]
+    Caller -.->|"随时查看或停止 (gepa status / stop)"| RunDir["runs/目录 (checkpoint.json + best/)"]
 
-    subgraph EngineLoop ["Engine::step 单次迭代"]
-        Start["迭代开始 (iteration + 1)"] --> CheckMerge{"是否存在待执行 Merge?<br/>(due > 0 且上轮有新候选)"}
-        CheckMerge -- 是 --> TryMerge["谱系三路合并 (try_merge)<br/>1. 从非支配池选共同祖先分支对<br/>2. 合并互补组件修改<br/>3. 5 个分层验证集样本预筛"]
-        TryMerge -- "无法构造有效合并对 (None)" --> Reflect
-        TryMerge -- "预筛通过 (after >= before)" --> FullVal["全量验证集评估 (val_eval)<br/>加入 State 并更新帕累托前沿"]
-        TryMerge -- "预筛未通过" --> Reject["触发 Event::Rejected"]
-
-        CheckMerge -- 否 --> Reflect["反射变异 (reflect)<br/>1. CandidateSelector 选父代 + EpochSampler 抽训练集 Minibatch<br/>2. Adapter::evaluate 获取父代得分与 feedback 轨迹<br/>3. ComponentSelector 选目标组件 + Adapter::propose 生成新文本<br/>4. 同一 Minibatch 评估子代得分"]
-        Reflect --> Gate{"Acceptance & Selection<br/>子代 Minibatch 得分门控与去重"}
-        Gate -- 通过 --> FullVal
-        Gate -- 未通过 --> Reject
+    subgraph Loop ["gepa 内部单轮进化"]
+        Pool -->|"2. 选出父代候选"| Eval["评估器 (gepa-eval)"]
+        Eval -->|"command_json: 驱动被测 LLM Agent 解题"| TargetAgent["被测 LLM Agent / 评测脚本"]
+        Eval -->|"shell_check: 写入隔离目录编译测速"| TargetFile["源码 / GPU Kernel 评测"]
+        TargetAgent -->|"返回 score + 报错轨迹"| Reflect["反思大模型 (gepa-reflect)"]
+        TargetFile -->|"返回 GEPA_SCORE(S) + 输出"| Reflect
+        Lineage["全量谱系记忆 (失败 Diff / 最优分支)"] --> Reflect
+        Reflect -->|"3. 生成新候选 (自动拦截重复)"| Gate{"训练集得分达标?"}
+        Gate -->|"是: 全量验证并落盘"| Pool
     end
 
-    FullVal --> EventNew["触发 Event::NewCandidate<br/>(若启用 Merge 则标记 due + 1)"]
+    Pool -->|"4. 产出最优文本"| RunDir
+    RunDir -->|"取走 best/*.txt"| Caller
 ```
 
----
-
-## 核心概念说明
-
-### 1. 数据所有权与 `Candidate`
-- **宿主持有原始数据**：`gepa-core` 不存储具体的训练/验证文本，仅通过 `DataId`（`0..train_len` 与 `0..val_len` 下标）向 `Adapter` 请求评估，保持引擎状态轻量且与业务数据结构解耦。
-- **多组件候选（`Candidate`）**：定义为 `BTreeMap<String, String>`（`组件名 -> 文本内容`），既支持单 Prompt 优化，也支持多模块 Agent 系统按轮询（`RoundRobin`）或全量（`All`）方式协同演化。
-
-### 2. `Adapter` 宿主接口
-接入任意评估环境与大模型只需实现 `gepa_core::Adapter`：
-- `evaluate(&mut self, candidate, split, ids, capture_traces) -> Result<EvalBatch>`：在指定的 `Train` 或 `Val` 子集下标上运行候选，返回每个样本的主得分 `scores`、可选多目标指标 `objectives` 以及用于反射的诊断信息 `feedback`（仅当 `capture_traces == true` 时需要）。
-- `propose(&mut self, parent, ids, eval, components) -> Result<BTreeMap<String, String>>`：根据父代在训练 Minibatch 上的运行反馈 `eval`，重写 `components` 指定的组件文本。
-- `on_event(&mut self, event)`（可选）：监听 `IterationStart`、`NewCandidate`、`Rejected`、`Skipped`、`Error` 事件。
-
-### 3. 四种帕累托前沿模式（`FrontierType`）
-| 模式 | 前沿维度 | 适用场景 |
-| :--- | :--- | :--- |
-| `Instance` | 每个验证集样本 `Val(id)` 独立一个前沿 | 防止擅长疑难样本的特化候选被高均值平庸候选淘汰 |
-| `Objective` | 每个评估指标 `Objective(name)` 独立一个前沿 | 多目标权衡（如准确率 vs. 响应长度/延迟） |
-| `Hybrid` *(默认)* | `Instance` ∪ `Objective` 并集 | 兼顾单样本特化能力与多指标平衡 |
-| `Cartesian` | `Cartesian(id, metric)` 样本 × 指标乘积 | 极细粒度的样本级多指标前沿追踪 |
-
-### 4. 停止条件（`Stop`）
-为防止无限消耗预算，`Engine::new` 强制要求至少配置一项停止条件（任一满足即停止）：
-- `max_metric_calls`：最大评估调用次数预算
-- `max_iterations`：最大迭代轮数
-- `max_candidates`：最多接受的候选总数
-- `score_threshold`：验证集最优均分达到阈值即停
-- `max_stale_iterations`：连续多少轮未刷新验证集最高均分即停（早停）
-- `timeout_secs`：墙钟超时秒数
-- `stop_file`：检测到指定路径文件存在时优雅退出
+- 让你的编码 Agent 自动接管配置与调优：[Agent.md](Agent.md)
+- 实现原理、算法细节与源码索引：[IMPLEMENTATION.md](IMPLEMENTATION.md)
 
 ---
 
-## 快速开始
+## 1. 直接使用（已有编译好的 `gepa` 可执行文件）
 
-### 构建与运行测试
+如果你手里已经有了编译好的 `gepa`（Windows 下为 `target/release/gepa.exe`），推荐直接交给编码 Agent（Claude Code、Cursor、Antigravity 等）跑：
+
+### 方式一：一句话交给编码 Agent 自动完成（推荐）
+
+把 `@Agent.md` 和 `gepa` 路径交给你的编码 Agent，然后只需在对话框里说清楚 **① 数据在哪、② 怎么评估打分、③ 反思大模型接口是什么**，例如：
+
+> 请阅读 `@Agent.md`，用 `gepa` 帮我优化系统提示词。  
+> 数据在 `data/train.jsonl` 和 `data/val.jsonl`；评估时把候选作为 system prompt 发给 `http://127.0.0.1:8080/v1`（`<model-name>`）运行我的判分逻辑；反思模型也用这个地址，先测基线再跑 50 预算。
+
+编码 Agent 会按 [Agent.md](Agent.md) 自动编写评估桥接脚本和 `task.json`、先跑单样本与 `--budget 0` 预检、后台启动优化，最后把最优结果交付给你。
+
+### 方式二：直接运行现成 `task.json`
 
 ```bash
-cargo test --workspace
+# 启动或断点续跑（中断后重跑同一命令自动从 checkpoint 恢复；加 --fresh 从头重跑）
+./target/release/gepa run task.json --run-dir runs/my_task --budget 50
+
+# 随时查看进度 / 优雅停止（最优产物输出在 runs/my_task/best/ 与 summary.json）
+./target/release/gepa status runs/my_task
+./target/release/gepa stop runs/my_task
 ```
 
-### CLI 用法（`gepa`）
+### 方式三：作为 Agent Skill 插件安装（免手动 `@Agent.md`）
 
-1. **生成任务模板（`init`）**：
-   ```bash
-   cargo run -p gepa-cli -- init my_task --mode generalize --eval shell-check -o my_task.task.json
-   ```
-   - `--mode`: `generalize`（`train` + `val` [+ `test`]）、`multi`（单数据集兼作训练与验证，默认隐藏 `expected`/`Expected answer`/`answer` 防止泄露答案）、`single`（无数据集单例黑盒优化）。
-   - `--eval`: `shell-check`（隔离工作区写入候选文件并执行 `check` 命令）、`command-json`（任意子进程 stdin/stdout JSON 协议）、`http`（HTTP JSON 评估端点）。
+将 Release 压缩包解压到 `~/.gemini/config/plugins/`（Antigravity）、`~/.claude/plugins/`（Claude Code）或项目 `.agents/skills/gepa/`，即可自动注册 `gepa` Skill 与内置的 `bin/gepa` 二进制，无需每次手动 `@Agent.md`。
 
-2. **运行与断点续跑（`run`）**：
-   ```bash
-   cargo run -p gepa-cli -- run my_task.task.json --run-dir runs/my_task --budget 150
-   ```
-   - 标准输出实时流式输出 NDJSON 事件（`seed_evaluated`、`iteration_start`、`new_candidate`、`rejected`、`skipped`、`completed`）。
-   - 每步原子落盘 `checkpoint.json`、`best_candidate.json`、`best/<component>.txt`、`run.log`，结束时写入 `summary.json`。再次对同一 `--run-dir` 执行 `gepa run` 会自动从断点恢复（加 `--fresh` 可忽略旧断点重跑）。
+---
 
-3. **查看状态与优雅停止（`status` / `stop`）**：
-   ```bash
-   cargo run -p gepa-cli -- status runs/my_task        # 首行输出自包含单行摘要，方便折叠式 UI 展示
-   cargo run -p gepa-cli -- status runs/my_task --json # 输出 JSON 摘要
-   cargo run -p gepa-cli -- stop runs/my_task          # 创建 STOP 文件通知引擎安全退出
-   ```
+## 2. 如果你想自己搭建与手动配置
 
-4. **兼容与迁移旧版 `gepa_plugin/tasks/*.json`（`convert`）**：
-   - `gepa run <legacy.json>` 会自动识别旧版 `tasks/*.json` 格式并在内存中完成兼容转换。
-   - 如需持久化迁移为新版通用 Schema：
-     ```bash
-     cargo run -p gepa-cli -- convert legacy_task.json -o task.json --python .venv/Scripts/python
-     ```
+### 2.1 从源码编译与四步运行
 
-### 通用 `task.json` Schema 示例（v1）
+前置条件：Rust 工具链（`cargo`），以及任意 OpenAI 兼容聊天接口（本地/内网 SGLang、vLLM 或云端 API；仅跑 `--budget 0` 基线时无需大模型）。
+
+```bash
+# 0. 编译单文件可执行程序 target/release/gepa（Windows 为 gepa.exe）
+cargo build --release -p gepa-cli
+
+# 1. 生成任务模板（eval 可选 command-json / shell-check / http）
+./target/release/gepa init demo --mode generalize --eval command-json -o task.json
+
+# 2. 先测初始基线（不调用反思模型）
+./target/release/gepa run task.json --run-dir runs/demo --budget 0
+
+# 3. 启动优化
+./target/release/gepa run task.json --run-dir runs/demo --budget 50
+
+# 4. 随时查看进度或优雅停止
+./target/release/gepa status runs/demo
+./target/release/gepa stop runs/demo
+```
+
+### 2.2 两类最小 `task.json` 模板
+
+#### 模板 A：优化 LLM Agent 提示词（`command_json`）
 
 ```json
 {
   "schema_version": 1,
-  "name": "my_task",
   "mode": "generalize",
-  "seed": {
-    "system_prompt": "You are a careful problem solver."
-  },
-  "dataset": {
-    "train": "data/train.jsonl",
-    "val": "data/val.jsonl",
-    "test": "data/test.jsonl"
-  },
+  "seed": { "system_prompt": "You are a careful coding assistant." },
+  "dataset": { "train": "train.jsonl", "val": "val.jsonl" },
   "evaluator": {
     "type": "command_json",
     "program": "python",
-    "args": ["eval_example.py"],
-    "timeout_secs": 300,
-    "concurrency": 4
+    "args": ["-X", "utf8", "eval_agent.py"],
+    "cwd": ".",
+    "concurrency": 2,
+    "timeout_secs": 300
   },
   "reflector": {
-    "lm": {
-      "base_url": "http://127.0.0.1:8080/v1",
-      "model": "default",
-      "temperature": 0.6,
-      "timeout_secs": 300
-    },
-    "objective": "Maximize solve accuracy while keeping responses concise.",
-    "background": "Optional domain guidance for the reflection LM."
+    "lm": { "base_url": "http://127.0.0.1:8080/v1", "model": "default" },
+    "objective": "Maximize pass rate and speed."
   },
-  "engine": {
-    "minibatch_size": 3,
-    "frontier": "hybrid",
-    "stop": {
-      "max_metric_calls": 150
-    }
-  }
+  "engine": { "minibatch_size": 3, "stop": { "max_metric_calls": 50 } }
 }
 ```
 
-### 在 Rust 代码中嵌入 `gepa-core`
+- **引擎写给 `stdin`**：`{"candidate": {"system_prompt": "..."}, "split": "train", "id": 0, "example": {...}, "capture_traces": true}`。
+- **脚本写回 `stdout`**（整段或最后一行以 `{` 开头的 JSON）：`{"score": 1.0, "objectives": {"pass": 1.0, "speedup": 1.2}, "side_info": {"Error": "..."}}`。
 
-```rust
-use std::collections::BTreeMap;
-use gepa_core::strategies::Stop;
-use gepa_core::{Adapter, Candidate, Config, DataId, Engine, EvalBatch, Event, Split};
-use serde_json::json;
+#### 模板 B：直接优化代码 / GPU Kernel 文件（`shell_check`）
 
-struct MyAdapter;
-
-impl Adapter for MyAdapter {
-    fn evaluate(
-        &mut self,
-        candidate: &Candidate,
-        _split: Split,
-        ids: &[DataId],
-        capture_traces: bool,
-    ) -> gepa_core::Result<EvalBatch> {
-        let prompt = &candidate["system_prompt"];
-        let scores: Vec<f64> = ids
-            .iter()
-            .map(|&id| if prompt.contains(&id.to_string()) { 1.0 } else { 0.0 })
-            .collect();
-        let feedback = if capture_traces {
-            ids.iter().map(|&id| json!({ "missing_id": id })).collect()
-        } else {
-            vec![]
-        };
-        Ok(EvalBatch { scores, feedback, ..Default::default() })
-    }
-
-    fn propose(
-        &mut self,
-        parent: &Candidate,
-        _ids: &[DataId],
-        eval: &EvalBatch,
-        components: &[String],
-    ) -> gepa_core::Result<BTreeMap<String, String>> {
-        let comp = &components[0];
-        let mut next_text = parent[comp].clone();
-        if let Some((fb, _)) = eval.feedback.iter().zip(&eval.scores).find(|(_, s)| **s < 1.0) {
-            next_text.push_str(&format!(" {}", fb["missing_id"]));
-        }
-        Ok(BTreeMap::from([(comp.clone(), next_text)]))
-    }
-
-    fn on_event(&mut self, event: &Event) {
-        println!("{event:?}");
-    }
-}
-
-fn main() -> gepa_core::Result<()> {
-    let mut adapter = MyAdapter;
-    let seed = Candidate::from([("system_prompt".into(), "init:".into())]);
-    let config = Config {
-        stop: Stop {
-            max_metric_calls: Some(200),
-            score_threshold: Some(1.0),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    // 初始化引擎（会对 seed 执行一次全量验证集评估）
-    let mut engine = Engine::new(config, seed, /*train_len=*/ 4, /*val_len=*/ 4, &mut adapter)?;
-
-    // 逐步执行并在每步后支持 JSON 序列化存档
-    while !engine.should_stop() {
-        engine.step(&mut adapter)?;
-        let _checkpoint_json = serde_json::to_string(&engine)?;
-    }
-
-    let (best_idx, best_candidate) = engine.best();
-    println!("Best #{best_idx}: {best_candidate:?}");
-    Ok(())
+```json
+{
+  "schema_version": 1,
+  "mode": "single",
+  "seed_files": { "code": "solve.py" },
+  "evaluator": {
+    "type": "shell_check",
+    "template_dir": ".",
+    "targets": { "code": "solve.py" },
+    "protect": ["check.py"],
+    "check": "python check.py",
+    "timeout_secs": 60
+  },
+  "reflector": {
+    "lm": { "base_url": "http://127.0.0.1:8080/v1", "model": "default" },
+    "objective": "Pass all checks as fast as possible."
+  },
+  "engine": { "minibatch_size": 1, "stop": { "max_metric_calls": 20 } }
 }
 ```
+
+- `protect` 里的文件会被快照校验，候选覆盖或脚本篡改直接记 `0` 分。
+- `check` 在 `stdout` 打印 `GEPA_SCORE=<浮点数>` 作为主分（不打印则退出码 `0` 记 `1.0`，非 `0` 记 `0.0`）；可选打印 `GEPA_SCORES={"acc": 1.0, "speed": 1.5}` 维护多目标帕累托前沿。
+
+### 2.3 常用配置速查
+
+- **数据模式（`mode`）**：`single`（单题调优，无需题库）、`multi`（同题库搜索并自动隐藏 `expected` / `Expected answer` / `answer` 防抄答案）、`generalize`（默认，`train`+`val` 或只填 `pool` 自动切分）。
+- **多组件分块与交叉**：在 `seed` / `seed_files` 放多个 key 即按轮询改写；在 `engine` 加 `"merge": {"max_invocations": 5, "val_overlap_floor": 1}` 可开启共同祖先三路合并。
+- **全量谱系记忆（默认开启）**：反思自动附带历史失败 Diff、跨分支最优与子指标榜首，并拦截重复提案；设 `reflector.lineage: false` 可关闭。
+- **旧版 `gepa_plugin` 迁移**：直接 `gepa run old_task.json` 自动兼容，或 `gepa convert old_task.json -o task.json` 导出新格式。
+- **鉴权与代理**：API Key 依次读取 `reflector.lm.api_key` → `GEPA_LM_API_KEY` → `OPENAI_API_KEY`；访问 `localhost`、`127.*`、`10.*`、`172.16–31.*`、`192.168.*` 自动绕过系统代理。
+- **运行产物**：`runs/<name>/best/*.txt`（最优文本）、`summary.json`、`checkpoint.json`、`lineage.json`、`run.log`。
 
 ---
 

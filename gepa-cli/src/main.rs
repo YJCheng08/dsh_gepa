@@ -242,6 +242,7 @@ fn scaffold_task(name: &str, mode: DataMode, eval: EvalKind) -> TaskSpec {
                 } else {
                     vec![]
                 },
+                ..Default::default()
             },
         },
         engine,

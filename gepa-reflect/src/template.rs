@@ -6,17 +6,36 @@ use gepa_core::{Candidate, DataId, EvalBatch};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+fn default_true() -> bool {
+    true
+}
+
 /// Prompt configuration for reflective mutation.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PromptConfig {
     pub objective: Option<String>,
     pub background: Option<String>,
     /// Optional custom template supporting `{component_name}`, `{current_text}`,
-    /// `{feedback}`, `{objective}`, and `{background}`.
+    /// `{feedback}`, `{lineage}`, `{objective}`, and `{background}`.
     pub custom_template: Option<String>,
     /// Top-level keys stripped from `EvalBatch.feedback` objects before rendering.
     pub hide_keys: Vec<String>,
+    /// Inject full-lineage memory (rejected edits, best branch, sub-metric leaders).
+    #[serde(default = "default_true")]
+    pub lineage: bool,
+}
+
+impl Default for PromptConfig {
+    fn default() -> Self {
+        Self {
+            objective: None,
+            background: None,
+            custom_template: None,
+            hide_keys: Vec::new(),
+            lineage: true,
+        }
+    }
 }
 
 /// Format minibatch scores, per-example objectives, and `feedback` into Markdown.
@@ -106,6 +125,18 @@ pub fn render_prompt(
     ids: &[DataId],
     eval: &EvalBatch,
 ) -> String {
+    render_prompt_with_lineage(config, parent, component, ids, eval, "")
+}
+
+/// Render the reflection prompt with optional full-lineage context injected before `## Task`.
+pub fn render_prompt_with_lineage(
+    config: &PromptConfig,
+    parent: &Candidate,
+    component: &str,
+    ids: &[DataId],
+    eval: &EvalBatch,
+    lineage_ctx: &str,
+) -> String {
     let current_text = parent.get(component).map(String::as_str).unwrap_or("");
     let feedback = format_feedback(ids, eval, &config.hide_keys);
     let objective = config.objective.as_deref().unwrap_or("");
@@ -116,6 +147,7 @@ pub fn render_prompt(
             .replace("{component_name}", component)
             .replace("{current_text}", current_text)
             .replace("{feedback}", &feedback)
+            .replace("{lineage}", lineage_ctx)
             .replace("{objective}", objective)
             .replace("{background}", background);
     }
@@ -149,6 +181,9 @@ pub fn render_prompt(
         "\n## Current `{component}`\n{fence}\n{current_text}\n{fence}"
     );
     let _ = writeln!(out, "\n## Evaluation Feedback\n{feedback}");
+    if !lineage_ctx.is_empty() {
+        let _ = writeln!(out, "\n## Lineage Memory\n{lineage_ctx}");
+    }
     let _ = write!(
         out,
         "\n## Task\nDiagnose why the current `{component}` failed or lost points in the feedback above, and write an improved replacement for `{component}`.\nReturn ONLY the complete updated text of `{component}` inside a single {fence} ... {fence} fenced code block."

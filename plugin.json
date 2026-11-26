@@ -1,0 +1,12 @@
+{
+  "name": "gepa",
+  "displayName": "GEPA Optimizer",
+  "version": "0.1.0",
+  "description": "Evolutionary Pareto optimizer (gepa-rs) for LLM agent system prompts, source code, and GPU kernels using execution feedback and full-lineage reflection.",
+  "repository": "https://github.com/YJCheng08/dsh_gepa",
+  "suggestedPrompts": [
+    "用 gepa 优化我的 Agent 系统提示词，先跑 0 预算测基线",
+    "用 gepa 自动调优这份算法或 Kernel 代码，让测试通过且速度最快",
+    "查看 runs/ 目录下的 gepa 优化进度并总结最优改动"
+  ]
+}
