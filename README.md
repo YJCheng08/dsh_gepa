@@ -32,9 +32,27 @@ gepa-rs/
 │   │   └── rng.rs         # 可序列化的确定性 SplitMix64 伪随机数生成器
 │   └── tests/
 │       └── engine.rs      # 端到端收敛、确定性快照回放、支配剪枝与合并单元测试
-├── gepa-reflect/    # [规划中/骨架] Adapter::propose 默认实现：渲染反馈模板并调用 OpenAI 兼容接口
-├── gepa-eval/       # [规划中/骨架] Adapter::evaluate 默认实现：子进程 JSON stdin/stdout 与 HTTP 评估器
-└── gepa-cli/        # [规划中/骨架] `gepa` 命令行入口：串联 eval + reflect，输出 NDJSON 事件流并逐步存盘
+├── gepa-reflect/    # [已完成] Adapter::propose 实现：反馈模板渲染、代码块提取与 OpenAI 兼容客户端
+│   └── src/
+│       ├── lib.rs         # Reflector 入口与单测
+│       ├── template.rs    # PromptConfig、有序 side_info 渲染与 hide_keys 脱敏
+│       ├── extract.rs     # <think> 推理块剥离与嵌套代码块提取
+│       └── client.rs      # LmClient trait 与 ureq 同步 OpenAiClient（自动绕过环回代理）
+├── gepa-eval/       # [已完成] Adapter::evaluate 实现：并发评估与跨平台进程树超时清理
+│   └── src/
+│       ├── lib.rs         # EvalConfig、Evaluator trait 与线程池并发调度
+│       ├── process.rs     # 跨平台进程树强杀（Windows taskkill /T、Unix killpg）
+│       ├── command.rs     # command_json：子进程 stdin/stdout JSON 协议评估器
+│       ├── workspace.rs   # shell_check：隔离临时工作区、protect 保护与 GEPA_SCORE 解析
+│       └── http.rs        # http：远程/本地 HTTP JSON 评估端点
+└── gepa-cli/        # [已完成] `gepa` 命令行入口与通用任务 Schema（含旧版任务兼容层）
+    ├── src/
+    │   ├── main.rs        # clap 子命令：run / init / status / stop / convert
+    │   ├── schema.rs      # 通用 TaskSpec v1（generalize / multi / single）与数据集加载
+    │   ├── legacy.rs      # gepa_plugin 旧版 tasks/*.json 自动识别与转换
+    │   └── runner.rs      # NDJSON 事件流、原子 checkpoint 存盘、status 摘要与 STOP 控制
+    └── tests/
+        └── cli.rs         # init / convert / run / resume / status / stop 端到端集成测试
 ```
 
 ---
@@ -101,6 +119,78 @@ flowchart TD
 
 ```bash
 cargo test --workspace
+```
+
+### CLI 用法（`gepa`）
+
+1. **生成任务模板（`init`）**：
+   ```bash
+   cargo run -p gepa-cli -- init my_task --mode generalize --eval shell-check -o my_task.task.json
+   ```
+   - `--mode`: `generalize`（`train` + `val` [+ `test`]）、`multi`（单数据集兼作训练与验证，默认隐藏 `expected`/`Expected answer`/`answer` 防止泄露答案）、`single`（无数据集单例黑盒优化）。
+   - `--eval`: `shell-check`（隔离工作区写入候选文件并执行 `check` 命令）、`command-json`（任意子进程 stdin/stdout JSON 协议）、`http`（HTTP JSON 评估端点）。
+
+2. **运行与断点续跑（`run`）**：
+   ```bash
+   cargo run -p gepa-cli -- run my_task.task.json --run-dir runs/my_task --budget 150
+   ```
+   - 标准输出实时流式输出 NDJSON 事件（`seed_evaluated`、`iteration_start`、`new_candidate`、`rejected`、`skipped`、`completed`）。
+   - 每步原子落盘 `checkpoint.json`、`best_candidate.json`、`best/<component>.txt`、`run.log`，结束时写入 `summary.json`。再次对同一 `--run-dir` 执行 `gepa run` 会自动从断点恢复（加 `--fresh` 可忽略旧断点重跑）。
+
+3. **查看状态与优雅停止（`status` / `stop`）**：
+   ```bash
+   cargo run -p gepa-cli -- status runs/my_task        # 首行输出自包含单行摘要，方便折叠式 UI 展示
+   cargo run -p gepa-cli -- status runs/my_task --json # 输出 JSON 摘要
+   cargo run -p gepa-cli -- stop runs/my_task          # 创建 STOP 文件通知引擎安全退出
+   ```
+
+4. **兼容与迁移旧版 `gepa_plugin/tasks/*.json`（`convert`）**：
+   - `gepa run <legacy.json>` 会自动识别旧版 `tasks/*.json` 格式并在内存中完成兼容转换。
+   - 如需持久化迁移为新版通用 Schema：
+     ```bash
+     cargo run -p gepa-cli -- convert legacy_task.json -o task.json --python .venv/Scripts/python
+     ```
+
+### 通用 `task.json` Schema 示例（v1）
+
+```json
+{
+  "schema_version": 1,
+  "name": "my_task",
+  "mode": "generalize",
+  "seed": {
+    "system_prompt": "You are a careful problem solver."
+  },
+  "dataset": {
+    "train": "data/train.jsonl",
+    "val": "data/val.jsonl",
+    "test": "data/test.jsonl"
+  },
+  "evaluator": {
+    "type": "command_json",
+    "program": "python",
+    "args": ["eval_example.py"],
+    "timeout_secs": 300,
+    "concurrency": 4
+  },
+  "reflector": {
+    "lm": {
+      "base_url": "http://127.0.0.1:8080/v1",
+      "model": "default",
+      "temperature": 0.6,
+      "timeout_secs": 300
+    },
+    "objective": "Maximize solve accuracy while keeping responses concise.",
+    "background": "Optional domain guidance for the reflection LM."
+  },
+  "engine": {
+    "minibatch_size": 3,
+    "frontier": "hybrid",
+    "stop": {
+      "max_metric_calls": 150
+    }
+  }
+}
 ```
 
 ### 在 Rust 代码中嵌入 `gepa-core`

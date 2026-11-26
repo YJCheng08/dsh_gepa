@@ -11,3 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 gepa-core.workspace = true
+gepa-reflect.workspace = true
+gepa-eval.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true

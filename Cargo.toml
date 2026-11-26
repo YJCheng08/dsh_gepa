@@ -9,5 +9,9 @@ license = "MIT"
 
 [workspace.dependencies]
 gepa-core = { path = "gepa-core" }
+gepa-reflect = { path = "gepa-reflect" }
+gepa-eval = { path = "gepa-eval" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+ureq = { version = "2.12", default-features = false, features = ["native-tls"] }
+clap = { version = "4", features = ["derive"] }
